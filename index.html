@@ -1,0 +1,348 @@
+<html>
+	<head>
+		<title>Resumable, Multi-Client Uploader</title>
+		<script src="aws-sdk.min.js" type="text/javascript"></script>
+		<script src="amazon-cognito.min.js" type="text/javascript"></script>
+	</head>
+	<body>
+	<fieldset>
+		<legend>Resumable, Multi-Client Uploader</legend>
+		<p>Upload your file from any computer and have it reassemble on our server</p>
+		<input type="file" accept="video/*" id="file"></input>
+		<progress id="progress"  max="" value=""></progress>
+	</fieldset>
+	<script>
+		// This is what kicks-off the whole process.
+		document.getElementById("file").addEventListener('change', function(e) {
+			uploadFile(e.target.files[0]);
+			document.getElementById("progress").setAttribute("max", e.target.files[0].size);
+		});
+
+		var s3 = null;
+		var syncManager = null;
+		var Bucket = 'vranjank';
+		var partsize = 5 * 1024 * 1024;
+
+		function uploadFile(file) {
+			// Set up the base state
+			var params = {
+				Bucket: 'vranjank',
+				Key: file.name,
+				filename: file.name,
+				filesize: file.size,
+				file: file
+			};
+				// The overall Algorithm
+				// 1. Initialize Amazon Services: S3 and Cognito
+				// 2. Get the Upload Id, either from S3 or Cognito
+				// 3. If this is a partial upload, get complete state from Cognito
+				// 4. Work on tickets (Recusive function)
+				InitializeServices(params) // void -> P[{syncManager, s3}] : A
+					.then(GetUploadId)       // A -> P[{A, dataset, UploadId}] : B
+					.then(InitializeState)   // B -> {B, Parts, Tickets} : C
+					.then(WorkOnTickets)
+		}
+		
+		// Mark the ticket as COMPLETE
+		function CompleteTicket(params) {
+			return MarkTicket(params, 2);
+		}
+		
+		// If tickets are all COMPLETE, send S3 and message to stitch uploads.
+		// {syncManager, s3, dataset, UploadId, Parts, Tickets, Ticket} -> P[{syncManager, s3, dataset, UploadId, Parts, Tickets, Ticket, FileETag, Location}]
+		function CompleteUpload(params) {
+			if(params.Tickets.filter(function(t) { return t == 2;}).length == params.Tickets.length) {
+				
+				var s3param = {
+					Bucket: params.Bucket,
+					Key: params.Key,
+					UploadId: params.UploadId,
+					MultipartUpload: {Parts: params.Parts}
+				};
+				
+				return new Promise(function(resolve, reject) {
+					s3.completeMultipartUpload(s3param, function(err, data){
+						if(err) reject(err);
+						else {
+							params.FileETag = data.ETag;
+							params.Location = data.Location;
+							resolve(params);
+						}
+					});
+				});
+			} else {
+				return params;
+			}
+		}
+		
+		// Slice the file into blobs and send it to S3.
+		// {syncManager, s3, dataset, UploadId, Parts, Tickets, Ticket} -> P[{syncManager, s3, dataset, UploadId, Parts, Tickets, Ticket}]
+		function SliceAndSendBlob(params) {
+			var s3 = params.s3;
+			var Ticket = params.Ticket;
+			var PartNumber = Ticket + 1;
+			var start = Ticket * partsize;
+			var end = Math.min(start + partsize, params.filesize);
+			
+			var uploadparam = {
+				Bucket: params.Bucket,
+				Key: params.Key,
+				UploadId: params.UploadId,
+				Body: params.file.slice(start, end),
+				PartNumber: PartNumber
+			};
+			
+			return new Promise(function(resolve, reject) {
+				s3.uploadPart(uploadparam, function(err, data) {
+					if(err) reject(err);
+					else {
+						params.Parts.push({ETag: data.ETag, PartNumber: PartNumber});
+						document.getElementById("progress").setAttribute("value", end.toString());
+						resolve(params);
+					}
+				});
+			});
+		}
+		
+		// Recursively work on Tickets
+		function WorkOnTickets(params) {
+			return PickTicket(params)
+				.then(TaskBasedOnTicket);
+		}
+		
+		function TaskBasedOnTicket(params){
+			switch(params.TicketState) {
+				// Base Case 1
+				case JOB_COMPLETE:
+					return CompleteUpload(params);
+					break;
+					
+				// Recursive Case
+				case JOB_AVAILABLE:
+					return SliceAndSendBlob(params)
+							.then(CompleteTicket)
+							.then(WorkOnTickets);
+					break;
+					
+				// Base Case 2
+				// Pause for 10 seconds and try to check again.
+				case JOB_NONE:
+				default:
+					return new Promise(function(resolve, reject) {
+						setTimeout(function() {
+							resolve(params);
+						}, 10 * 1000);
+					});
+					break;
+			}
+			return params;
+		}
+		
+		// {syncManager, s3, dataset, UploadId, Parts, Tickets} -> {syncManager, s3, dataset, UploadId, Parts, Tickets, Ticket}
+		var JOB_NONE = 1;
+		var JOB_COMPLETE = 2;
+		var JOB_AVAILABLE = 0;
+		function PickTicket(params) {
+			var tickets = params.Tickets;
+			var ticket = tickets.indexOf(0);
+			if(params.Ticket) delete params.Ticket;
+			
+			if(ticket == -1) {
+				// All the tickets are being worked on.
+				params.TicketState = JOB_NONE;
+				return params;
+			} else if(tickets.filter(function(ticket) {
+										return ticket == 2;
+									}).length == tickets.length) {
+				// All the tickets are over. Complete the job.
+				params.TicketState = JOB_COMPLETE;
+				return params;
+			} else {
+				// Work on the ticket.
+				params.Ticket = ticket;
+				
+				params.TicketState = JOB_AVAILABLE;
+	
+				// Mark The Ticket
+				return MarkTicket(params, 1);
+			}
+			return params;
+		}
+		
+		function MarkTicket(params, mark) {
+			params.Tickets[params.Ticket] = mark;
+			var putTickets = SetToDataset(params, "Tickets", params.Tickets);
+			return putTickets;
+		}
+		
+		// () -> P[{syncManager, s3}]
+		function InitializeServices(params) {
+			// Initialize the Amazon Cognito credentials provider
+			AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+			    IdentityPoolId: 'us-east-1:e26ba06c-96c0-4a01-8105-55af4cd0d12a'
+			});
+			
+			AWS.config.region = 'us-east-1';
+			
+			var s3params = {
+				"params": {
+					Bucket: params.Bucket,
+					ACL: 'public-read',
+					StorageClass: 'REDUCED_REDUNDANCY'
+				}
+			};
+	
+			return new Promise(function(resolve,reject) {
+				try {
+					AWS.config.credentials.get(function() {
+					    params.syncManager = new AWS.CognitoSyncManager();
+						params.s3 = new AWS.S3(s3params);
+						
+						resolve(params);
+					});
+				} catch(err) {
+					reject(err);
+				}
+			});
+		}
+		
+		/**
+		 * Get UploadId from either s3 or cognito.
+		 * The next - step shouldn't know where it came from.
+		 * {syncManager, s3} -> P[{syncManager, s3, dataset, UploadId}]
+		 */
+		function GetUploadId(params) {
+			var syncManager = params.syncManager;
+			var s3 			= params.s3;
+		
+			// Get the state of the file from Cognito.
+			return new Promise(function(resolve, reject) {
+				syncManager.openOrCreateDataset(params.filename, function(err, dataset) {
+					if(err) reject(err);
+					params.dataset = dataset;
+					// If UploadId exists, just upload parts.
+					dataset.get("UploadId", function(err, UploadId) {
+						if(err) reject(err);
+						
+						// If UploadId, setup the initial state.
+						if(UploadId) {
+							params.UploadId = UploadId;
+							resolve(params);
+						} else {
+							GetNewUploadId(params)
+								.then(function(params) {
+									resolve(params);
+								});
+						}
+					});
+				});
+			});
+		}
+		
+		// Simply set the state of the tickets.
+		function GetNewUploadId(params) {
+			// Get the upload ID from S3 for all subsequent uploads to this file.
+			var s3 = params.s3;
+			var newUploadId = new Promise(function(resolve, reject) {
+				s3.createMultipartUpload({Bucket: params.Bucket, Key: params.Key}, function(err, data) {
+					if(err) reject(err);
+					var UploadId = data.UploadId;
+					
+					if(UploadId) {
+						params.UploadId = UploadId;
+						resolve(params);
+					} else reject(params); 
+				});
+			});
+			
+			newUploadId
+				.then(SetNewUploadId)
+				.then(synchronize);
+			return newUploadId;
+		}
+		
+		function SetNewUploadId(params) {
+			var UploadId = params.UploadId;
+			var result = SetToDataset(params, "UploadId", UploadId);
+			return result;
+		}
+		
+		// {syncManager, s3, dataset, UploadId} -> {syncManager, s3, dataset, UploadId, Parts, Tickets}
+		function InitializeState(params) {
+			// Initial Tickets state; [0,0,0...]
+			var Tickets = GetTickets(params);
+			
+			var Parts = GetParts(params);
+			
+			return Promise.all([Parts, Tickets])
+				.then(function(values) {
+					params.Parts = values[0];
+					params.Tickets = values[1];
+					return params;
+				});
+		}
+		
+		function GetTickets(params) {
+			var newTickets = Array.apply(null, new Array(Math.ceil(params.filesize / partsize))).map(function(){return 0;});
+			return GetFromDataset(params, "Tickets", newTickets);
+		}
+		
+		function GetParts(params) {
+			return GetFromDataset(params, "Parts", []);
+		}
+		
+		function GetFromDataset(params, keyString, newValue) {
+			var dataset = params.dataset;
+			return new Promise(function(resolve, reject) {
+				dataset.get(keyString, function(err, value) {
+					if(err) reject(err);
+					else {
+						if(value) resolve(value);	// Return existing value
+						else resolve(newValue); // Generate new value.
+					}
+				});
+			});
+		}
+		
+		function SetToDataset(params, keyString, value) {
+			var dataset = params.dataset;
+			var result = new Promise(function(resolve, reject) {
+				dataset.put(keyString, value, function(err, record) {
+					if(err) reject(err);
+					else resolve(params);
+				});
+			});
+			
+			result.then(synchronize);
+			return result;
+		}
+			
+		function AbortUpload(s3, UploadId) {
+			return new Promise(function(resolve, reject) {
+				s3.abortMultipartUpload({UploadId: UploadId}, function(err, data) { 
+					if(err) reject(err);
+					else resolve(data);
+				});
+			});
+		};
+		
+		function synchronize(params) {
+			console.group("Synchronize");
+			console.dir(params);
+			console.groupEnd("Synchronize");
+			return params;
+			return new Promise(function (resolve, reject) {
+				params.dataset.synchronize({
+				  onSuccess: function(dataset, newRecords) {
+				     resolve(params);
+				  },
+				
+				  onFailure: function(err) {
+				     reject(err)
+				  },
+				});
+			});
+		}
+		</script>
+	</body>
+</html>
